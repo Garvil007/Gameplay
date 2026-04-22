@@ -50,12 +50,23 @@ DEFAULT_OVERPASS_URL = OVERPASS_MIRRORS[0]
 
 NOMINATIM_URL = "https://nominatim.openstreetmap.org"
 
-# A proper User-Agent with contact info — OSM's policy requires this and they
-# block generic/missing UAs. Include a real identifier for your deployment.
-USER_AGENT = ("USSportsFacilityFinder/1.0 "
-              "(https://github.com/your-org/sports-finder; "
-              "contact@example.com)")
-HEADERS = {"User-Agent": USER_AGENT}
+# Nominatim's usage policy REQUIRES a descriptive User-Agent. Fake URLs or
+# emails get blocked with HTTP 403. You can override via env var CONTACT_EMAIL
+# in Streamlit Cloud Secrets to put your real email here.
+_CONTACT = os.environ.get("CONTACT_EMAIL", "")
+if _CONTACT:
+    USER_AGENT = f"SportsFacilityFinder/1.0 ({_CONTACT})"
+else:
+    # Fallback: just the app name + version, no fake contact info.
+    # This is less preferred by Nominatim but often still accepted.
+    USER_AGENT = "SportsFacilityFinder/1.0"
+
+# Use a browser-like Accept header too
+HEADERS = {
+    "User-Agent": USER_AGENT,
+    "Accept": "application/json",
+    "Accept-Language": "en-US,en;q=0.9",
+}
 
 # Thread-safe lock for log messages from worker threads
 _log_lock = Lock()
@@ -243,8 +254,52 @@ def normalize_key(name):
 # ═══════════════════════════════════════════════════════════
 # CITY BOUNDING BOX LOOKUP
 # ═══════════════════════════════════════════════════════════
+
+# Alternative Nominatim endpoints to try if the main one blocks us.
+# Note: these are not 1:1 mirrors — they may have different data/freshness,
+# but they all support the same /search and /reverse endpoints.
+NOMINATIM_MIRRORS = [
+    "https://nominatim.openstreetmap.org",
+    "https://nominatim.openstreetmap.de",  # German OSMF mirror
+]
+
+
+def _nominatim_request(path, params, timeout=20):
+    """Try each Nominatim mirror in order. Returns (response_data, url_used)
+    or raises an exception on complete failure."""
+    last_error = None
+    for url in NOMINATIM_MIRRORS:
+        try:
+            resp = requests.get(f"{url}{path}", params=params,
+                                headers=HEADERS, timeout=timeout)
+            if resp.status_code == 403:
+                # Blocked — try next mirror
+                last_error = f"{url}: 403 Forbidden (User-Agent rejected)"
+                continue
+            if resp.status_code == 429:
+                # Rate limited — try next mirror
+                last_error = f"{url}: 429 rate limited"
+                continue
+            resp.raise_for_status()
+            return resp.json(), url
+        except requests.exceptions.HTTPError as e:
+            last_error = f"{url}: HTTP {resp.status_code}"
+            continue
+        except requests.exceptions.Timeout:
+            last_error = f"{url}: timeout"
+            continue
+        except requests.exceptions.ConnectionError:
+            last_error = f"{url}: connection refused"
+            continue
+        except Exception as e:
+            last_error = f"{url}: {type(e).__name__}"
+            continue
+
+    raise RuntimeError(f"All Nominatim mirrors failed. Last error: {last_error}")
+
+
 def lookup_city_bbox(city, county, state="California", country="USA", use_cache=True):
-    """Use Nominatim to get bounding box for a city, with caching."""
+    """Use Nominatim to get bounding box for a city, with caching + mirror fallback."""
     key = _cache_key("city_bbox", city, county, state, country)
     if use_cache:
         cached = cache_get(key)
@@ -253,10 +308,7 @@ def lookup_city_bbox(city, county, state="California", country="USA", use_cache=
     try:
         query = f"{city}, {county}, {state}, {country}"
         params = {"q": query, "format": "json", "limit": 1, "addressdetails": 1}
-        resp = requests.get(f"{NOMINATIM_URL}/search", params=params,
-                            headers=HEADERS, timeout=20)
-        resp.raise_for_status()
-        data = resp.json()
+        data, _ = _nominatim_request("/search", params)
         if not data:
             return None
         bbox = data[0].get("boundingbox")
@@ -275,6 +327,26 @@ def lookup_city_bbox(city, county, state="California", country="USA", use_cache=
         if use_cache:
             cache_set(key, result)
         return result
+    except RuntimeError as e:
+        err = str(e)
+        if "403" in err:
+            st.error(
+                "🚫 **Nominatim blocked the request (HTTP 403).**\n\n"
+                "OSM's Nominatim requires a valid User-Agent with real contact "
+                "info, and blocks deployments that don't comply.\n\n"
+                "**If you deployed on Streamlit Cloud:**\n"
+                "1. Go to your app → Manage app → Settings → Secrets\n"
+                "2. Add this line (use your real email):\n"
+                "```\n"
+                'CONTACT_EMAIL = "your.email@example.com"\n'
+                "```\n"
+                "3. Save → the app restarts automatically\n\n"
+                "After this, your requests will identify who's running them, "
+                "and Nominatim will allow them."
+            )
+        else:
+            st.error(f"Nominatim lookup failed: {err}")
+        return None
     except Exception as e:
         st.error(f"Error looking up city bbox: {e}")
         return None
@@ -550,6 +622,8 @@ def fetch_nominatim(city, state, bbox, sport_config, status_callback, use_cache=
     status_callback("Source 2: Nominatim Search API...")
     searches = build_nominatim_searches(city, state, sport_config)
     results = []
+    nominatim_broken = False  # trips when Nominatim is completely unavailable
+
     for query in searches:
         # Check cache
         cached_data = None
@@ -561,20 +635,24 @@ def fetch_nominatim(city, state, bbox, sport_config, status_callback, use_cache=
             data = cached_data
             from_cache = True
         else:
+            if nominatim_broken:
+                status_callback(f"  ⏭️ [{query[:50]}] skipped (Nominatim unavailable)")
+                continue
             try:
                 params = {
                     "q": query, "format": "json", "addressdetails": 1, "limit": 20,
                 }
-                resp = requests.get(f"{NOMINATIM_URL}/search", params=params,
-                                    headers=HEADERS, timeout=30)
-                resp.raise_for_status()
-                data = resp.json()
+                data, _ = _nominatim_request("/search", params, timeout=30)
                 if use_cache:
                     cache_set(_cache_key("nominatim_search", query), data)
                 from_cache = False
-                time.sleep(1.2)  # only sleep when we actually called the API
+                time.sleep(1.2)  # rate limit when actually hitting the API
+            except RuntimeError as e:
+                status_callback(f"  ❌ [{query[:50]}] {e}")
+                nominatim_broken = True
+                continue
             except Exception as e:
-                status_callback(f"  [{query[:50]}] FAILED: {e}")
+                status_callback(f"  ❌ [{query[:50]}] {type(e).__name__}")
                 continue
 
         count = 0
@@ -753,10 +831,7 @@ def _reverse_geocode_one(entry, target_city, nominatim_url=NOMINATIM_URL,
     try:
         params = {"lat": entry["lat"], "lon": entry["lon"], "format": "json",
                   "addressdetails": 1, "zoom": 18}
-        resp = requests.get(f"{nominatim_url}/reverse", params=params,
-                            headers=HEADERS, timeout=20)
-        resp.raise_for_status()
-        data = resp.json()
+        data, _ = _nominatim_request("/reverse", params, timeout=20)
         addr = data.get("address", {})
         road = addr.get("road", "")
         house = addr.get("house_number", "")

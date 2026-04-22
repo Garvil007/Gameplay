@@ -1333,15 +1333,15 @@ def main():
 
     # If Overpass entirely failed, show an informational warning (not fatal —
     # Nominatim may still return enough results)
-    if len(overpass_results) == 0:
-        st.warning(
-            "⚠️ **Overpass API is unavailable right now.** Falling back to "
-            "Nominatim-only results (which usually still finds most parks, "
-            "schools, and rec centers, but may miss some smaller facilities).\n\n"
-            "If you need complete data:\n"
-            "- Run the app **locally** — `streamlit run sports_facility_finder.py`\n"
-            "- Or self-host Overpass (see OVERPASS_LOCAL_SETUP.md)"
-        )
+    # if len(overpass_results) == 0:
+    #     st.warning(
+    #         "⚠️ **Overpass API is unavailable right now.** Falling back to "
+    #         "Nominatim-only results (which usually still finds most parks, "
+    #         "schools, and rec centers, but may miss some smaller facilities).\n\n"
+    #         "If you need complete data:\n"
+    #         "- Run the app **locally** — `streamlit run sports_facility_finder.py`\n"
+    #         "- Or self-host Overpass (see OVERPASS_LOCAL_SETUP.md)"
+    #     )
 
     progress_bar.progress(40, text="Fetching from Nominatim...")
     log(f"\n[3/6] Fetching from Nominatim Search...")

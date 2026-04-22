@@ -37,9 +37,24 @@ from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 # ═══════════════════════════════════════════════════════════
 # CONFIG
 # ═══════════════════════════════════════════════════════════
-DEFAULT_OVERPASS_URL = "https://overpass-api.de/api/interpreter"
+# Multiple public Overpass mirror endpoints. If the first fails, we fall back
+# to others. This helps when one mirror is rate-limiting your IP (common on
+# Streamlit Cloud, PythonAnywhere, and other shared hosting).
+OVERPASS_MIRRORS = [
+    "https://overpass-api.de/api/interpreter",          # Main instance
+    "https://overpass.kumi.systems/api/interpreter",    # Kumi.systems mirror
+    "https://overpass.osm.ch/api/interpreter",          # Swiss OSM mirror
+    "https://overpass.openstreetmap.fr/api/interpreter", # French OSM mirror
+]
+DEFAULT_OVERPASS_URL = OVERPASS_MIRRORS[0]
+
 NOMINATIM_URL = "https://nominatim.openstreetmap.org"
-USER_AGENT = "USSportsFacilityFinder/1.0 (educational project)"
+
+# A proper User-Agent with contact info — OSM's policy requires this and they
+# block generic/missing UAs. Include a real identifier for your deployment.
+USER_AGENT = ("USSportsFacilityFinder/1.0 "
+              "(https://github.com/your-org/sports-finder; "
+              "contact@example.com)")
 HEADERS = {"User-Agent": USER_AGENT}
 
 # Thread-safe lock for log messages from worker threads
@@ -271,6 +286,36 @@ def in_bbox(lat, lon, bbox):
 # ═══════════════════════════════════════════════════════════
 # SOURCE 1: OVERPASS API
 # ═══════════════════════════════════════════════════════════
+
+# Circuit breaker: when shared across threads, the first failure causes
+# all remaining queries to skip instantly instead of wasting 90+ seconds
+# each on timeouts/retries.
+class OverpassCircuitBreaker:
+    def __init__(self):
+        self._lock = Lock()
+        self._tripped = False
+        self._reason = ""
+
+    def is_tripped(self):
+        with self._lock:
+            return self._tripped
+
+    def trip(self, reason):
+        with self._lock:
+            if not self._tripped:
+                self._tripped = True
+                self._reason = reason
+
+    def reason(self):
+        with self._lock:
+            return self._reason
+
+    def reset(self):
+        with self._lock:
+            self._tripped = False
+            self._reason = ""
+
+
 def build_overpass_queries(bbox, sport_config):
     bbox_str = f"{bbox['min_lat']},{bbox['min_lon']},{bbox['max_lat']},{bbox['max_lon']}"
     sports_pattern = "|".join(sport_config["osm_sports"])
@@ -305,70 +350,149 @@ def build_overpass_queries(bbox, sport_config):
  way["amenity"="community_centre"]({bbox_str}););out center tags;""",
     }
 
-def query_overpass(name, query, overpass_url, status_callback, max_retries=4,
-                    use_cache=True):
-    """Run a single Overpass query with retries + caching."""
-    # Check cache first
+def query_overpass(name, query, overpass_url, status_callback, breaker,
+                    use_cache=True, timeout=45):
+    """Run a single Overpass query. Fail fast — no retries, no per-query
+    mirror hopping. The circuit breaker ensures that once any query fails,
+    subsequent queries skip immediately."""
+    # Check cache first (always)
     if use_cache:
-        key = _cache_key("overpass", overpass_url, query)
-        cached = cache_get(key)
+        cache_k = _cache_key("overpass", overpass_url, query)
+        cached = cache_get(cache_k)
         if cached is not None:
             with _log_lock:
                 status_callback(f"  [{name}] 💾 cached ({len(cached)} elements)")
             return name, cached
 
+    # If circuit breaker is tripped, skip immediately
+    if breaker.is_tripped():
+        with _log_lock:
+            status_callback(f"  [{name}] ⏭️ skipped (Overpass unavailable)")
+        return name, []
+
+    mirror_name = (overpass_url.split("//")[1].split("/")[0]
+                    if "//" in overpass_url else overpass_url)
     resp = None
-    for attempt in range(1, max_retries + 1):
-        try:
-            with _log_lock:
-                status_callback(f"  [{name}] attempt {attempt}...")
-            resp = requests.post(overpass_url, data={"data": query},
-                                 timeout=180, headers=HEADERS)
-            resp.raise_for_status()
-            elems = resp.json().get("elements", [])
-            with _log_lock:
-                status_callback(f"  [{name}] -> {len(elems)} elements")
-            if use_cache:
-                cache_set(_cache_key("overpass", overpass_url, query), elems)
-            return name, elems
-        except requests.exceptions.HTTPError:
-            status = resp.status_code if resp is not None else 0
-            if status in (429, 504) and attempt < max_retries:
-                wait = 15 * attempt
-                with _log_lock:
-                    status_callback(f"  [{name}] {status} error, retrying in {wait}s...")
-                time.sleep(wait)
-            else:
-                with _log_lock:
-                    status_callback(f"  [{name}] FAILED after {attempt} attempts")
-                return name, []
-        except Exception as e:
-            if attempt < max_retries:
-                time.sleep(15 * attempt)
-            else:
-                with _log_lock:
-                    status_callback(f"  [{name}] FAILED: {e}")
-                return name, []
+    try:
+        with _log_lock:
+            status_callback(f"  [{name}] querying {mirror_name}...")
+        resp = requests.post(overpass_url, data={"data": query},
+                             timeout=timeout, headers=HEADERS)
+        resp.raise_for_status()
+        elems = resp.json().get("elements", [])
+        with _log_lock:
+            status_callback(f"  [{name}] ✅ {len(elems)} elements")
+        if use_cache:
+            cache_set(_cache_key("overpass", overpass_url, query), elems)
+        return name, elems
+    except requests.exceptions.HTTPError:
+        status = resp.status_code if resp is not None else 0
+        reason = f"HTTP {status}"
+    except requests.exceptions.Timeout:
+        reason = f"timeout after {timeout}s"
+    except requests.exceptions.ConnectionError:
+        reason = "connection refused"
+    except Exception as e:
+        reason = f"{type(e).__name__}"
+
+    breaker.trip(reason)
+    with _log_lock:
+        status_callback(f"  [{name}] ❌ {reason} — tripping circuit breaker, "
+                        f"remaining queries will skip")
     return name, []
+
+
+def probe_overpass(overpass_url, status_callback, timeout=10):
+    """Quick health check — send a trivial query that should return instantly.
+    If it fails, we know the Overpass endpoint is unavailable and skip all
+    real queries (saving minutes of wasted retries)."""
+    # Trivial query: return 1 node from a tiny bbox
+    probe_query = "[out:json][timeout:5];node(0,0,0.001,0.001);out count;"
+    mirror_name = (overpass_url.split("//")[1].split("/")[0]
+                    if "//" in overpass_url else overpass_url)
+    status_callback(f"  Probing {mirror_name}...")
+    try:
+        resp = requests.post(overpass_url, data={"data": probe_query},
+                             timeout=timeout, headers=HEADERS)
+        resp.raise_for_status()
+        status_callback(f"  ✅ {mirror_name} is responsive")
+        return True
+    except requests.exceptions.HTTPError:
+        status = resp.status_code if resp is not None else 0
+        status_callback(f"  ❌ {mirror_name} returned HTTP {status}")
+        return False
+    except requests.exceptions.Timeout:
+        status_callback(f"  ❌ {mirror_name} timed out after {timeout}s")
+        return False
+    except requests.exceptions.ConnectionError:
+        status_callback(f"  ❌ {mirror_name} connection refused")
+        return False
+    except Exception as e:
+        status_callback(f"  ❌ {mirror_name} error: {type(e).__name__}")
+        return False
+
+
+def pick_working_overpass(preferred_url, status_callback, is_local=False):
+    """Given a preferred URL, probe it. If it fails AND it's a public URL,
+    probe each mirror in order. Return the first working URL, or None if
+    all fail."""
+    if is_local:
+        # Local URL — only try it, no mirror fallback
+        if probe_overpass(preferred_url, status_callback):
+            return preferred_url
+        return None
+
+    # Public URL — try preferred first, then mirrors
+    urls_to_try = [preferred_url]
+    for mirror in OVERPASS_MIRRORS:
+        if mirror != preferred_url:
+            urls_to_try.append(mirror)
+
+    for url in urls_to_try:
+        if probe_overpass(url, status_callback):
+            return url
+    return None
 
 
 def fetch_overpass(bbox, sport_config, overpass_url, status_callback,
                     is_local=False, use_cache=True):
-    """Run all Overpass queries in parallel using a thread pool.
-    For local Overpass, uses 6 workers (no rate limit).
-    For public Overpass, uses 2 workers (avoid rate limiting)."""
+    """Run all Overpass queries in parallel with fail-fast behavior.
+
+    Strategy:
+      1. First, probe with a trivial 10-second query to see if Overpass works.
+      2. If probe fails, try public mirrors until one responds (or give up).
+      3. If all mirrors fail, return [] immediately — no wasted minutes.
+      4. If any query during the real fetch fails, the circuit breaker trips
+         and remaining queries skip instantly.
+    """
     is_local_url = ("localhost" in overpass_url or "127.0.0.1" in overpass_url
                     or is_local)
-    max_workers = 6 if is_local_url else 2
-    status_callback(f"Source 1: Overpass API ({'LOCAL' if is_local_url else 'PUBLIC'}, "
-                    f"{max_workers} parallel workers)...")
+
+    status_callback(f"Source 1: Overpass API ({'LOCAL' if is_local_url else 'PUBLIC'})...")
+
+    # Step 1: Probe to find a working endpoint
+    status_callback("  Quick health check (max 10s per mirror)...")
+    working_url = pick_working_overpass(overpass_url, status_callback,
+                                          is_local=is_local_url)
+    if working_url is None:
+        status_callback("  ⚠️  No Overpass endpoint responded. "
+                        "Skipping Overpass entirely — using Nominatim only.")
+        return []
+
+    if working_url != overpass_url:
+        status_callback(f"  ℹ️ Falling back to {working_url}")
+
+    # Step 2: Actual queries with circuit breaker
+    max_workers = 6 if is_local_url else 3
+    status_callback(f"  Running queries ({max_workers} parallel workers)...")
     queries = build_overpass_queries(bbox, sport_config)
     results = []
+    breaker = OverpassCircuitBreaker()
 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = {
-            executor.submit(query_overpass, qname, qtext, overpass_url,
-                             status_callback, 4, use_cache): qname
+            executor.submit(query_overpass, qname, qtext, working_url,
+                             status_callback, breaker, use_cache): qname
             for qname, qtext in queries.items()
         }
         for future in as_completed(futures):
@@ -396,6 +520,8 @@ def fetch_overpass(bbox, sport_config, overpass_url, status_callback,
             except Exception as e:
                 status_callback(f"  Worker error: {e}")
 
+    if breaker.is_tripped():
+        status_callback(f"  ⚠️ Overpass had issues: {breaker.reason()}")
     status_callback(f"  Overpass total: {len(results)} raw elements")
     return results
 
@@ -1027,15 +1153,29 @@ def main():
         st.divider()
 
         with st.expander("⚡ Performance / Advanced", expanded=False):
-            overpass_url = st.text_input(
-                "Overpass API URL",
-                value=DEFAULT_OVERPASS_URL,
-                help=("Use 'http://localhost:8080/api/interpreter' if you've set up "
-                      "a local Overpass server with Docker (see OVERPASS_LOCAL_SETUP.md). "
-                      "Local = unlimited, ~10x faster, no 504 errors."),
+            st.markdown("**Overpass API server**")
+            mirror_options = ["Auto (try all public mirrors)"] + OVERPASS_MIRRORS + ["Custom URL..."]
+            mirror_choice = st.selectbox(
+                "Endpoint",
+                options=mirror_options,
+                index=0,
+                help=("If the main Overpass server blocks your requests "
+                      "(common on Streamlit Cloud), try a different mirror. "
+                      "The app will auto-fallback through mirrors on failure."),
             )
-            st.caption("💡 Local Overpass auto-detects and uses 6 parallel "
-                       "workers (vs 2 for public)")
+            if mirror_choice == "Custom URL...":
+                overpass_url = st.text_input(
+                    "Custom Overpass URL",
+                    value="http://localhost:8080/api/interpreter",
+                    help=("Use this for a self-hosted Overpass instance. "
+                          "See OVERPASS_LOCAL_SETUP.md."),
+                )
+            elif mirror_choice == "Auto (try all public mirrors)":
+                overpass_url = OVERPASS_MIRRORS[0]  # start with main, fallback via code
+            else:
+                overpass_url = mirror_choice
+            st.caption("💡 Local Overpass (localhost) auto-detects and uses 6 "
+                        "parallel workers (vs 2 for public)")
 
             st.divider()
             use_cache = st.checkbox(
@@ -1115,6 +1255,18 @@ def main():
                                        is_local=is_local_overpass,
                                        use_cache=use_cache)
     log(f"  ⏱️ Overpass took {time.time() - t0:.1f}s")
+
+    # If Overpass entirely failed, show an informational warning (not fatal —
+    # Nominatim may still return enough results)
+    if len(overpass_results) == 0:
+        st.warning(
+            "⚠️ **Overpass API is unavailable right now.** Falling back to "
+            "Nominatim-only results (which usually still finds most parks, "
+            "schools, and rec centers, but may miss some smaller facilities).\n\n"
+            "If you need complete data:\n"
+            "- Run the app **locally** — `streamlit run sports_facility_finder.py`\n"
+            "- Or self-host Overpass (see OVERPASS_LOCAL_SETUP.md)"
+        )
 
     progress_bar.progress(40, text="Fetching from Nominatim...")
     log(f"\n[3/6] Fetching from Nominatim Search...")

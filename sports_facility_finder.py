@@ -299,57 +299,176 @@ def _nominatim_request(path, params, timeout=20):
 
 
 def lookup_city_bbox(city, county, state="California", country="USA", use_cache=True):
-    """Use Nominatim to get bounding box for a city, with caching + mirror fallback."""
-    key = _cache_key("city_bbox", city, county, state, country)
+    """Find the bounding box AND polygon for a city using Nominatim.
+
+    Returns dict with min_lat/max_lat/min_lon/max_lon (bbox) and optionally
+    'polygon' (list of (lat, lon) points forming the city outline) for
+    precise point-in-polygon checks later.
+
+    Strategies (tried in order until one returns a valid city result):
+      1. Structured query (city + county + state + country)
+      2. Free-form query "city, county, state, country"
+      3. Free-form query "city, state, country"
+      4. Free-form query "city, state"
+    """
+    key = _cache_key("city_bbox_v2", city, county, state, country)
     if use_cache:
         cached = cache_get(key)
         if cached is not None:
             return cached
+
+    VALID_CLASSES = {"boundary", "place"}
+    target_lower = city.lower().strip()
+
+    def _validate(item):
+        cls = item.get("class", "").lower()
+        typ = item.get("type", "").lower()
+        if cls not in VALID_CLASSES:
+            return False
+        if "county" in typ:
+            return False
+        display = item.get("display_name", "").lower()
+        first_part = display.split(",")[0].strip()
+        if target_lower not in first_part:
+            return False
+        if "county" in first_part and "county" not in target_lower:
+            return False
+        return True
+
+    # Build query strategies — request GeoJSON polygon (polygon_geojson=1)
+    strategies = []
+    base_params = {"format": "json", "limit": 5, "addressdetails": 1,
+                    "polygon_geojson": 1}
+
+    # 1. Structured query
+    structured = {**base_params, "city": city, "country": country}
+    if state:
+        structured["state"] = state
+    if county:
+        structured["county"] = county
+    strategies.append(("structured", structured))
+
+    # 2-4. Free-form variants
+    if county:
+        strategies.append(("free-form full",
+            {**base_params, "q": f"{city}, {county}, {state}, {country}"}))
+    strategies.append(("free-form no county",
+        {**base_params, "q": f"{city}, {state}, {country}"}))
+    strategies.append(("free-form minimal",
+        {**base_params, "q": f"{city}, {state}"}))
+
+    valid_item = None
+    for label, params in strategies:
+        try:
+            data, _ = _nominatim_request("/search", params)
+            if not data:
+                continue
+            for item in data:
+                if _validate(item):
+                    valid_item = item
+                    break
+            if valid_item:
+                break
+        except RuntimeError as e:
+            err = str(e)
+            if "403" in err:
+                st.error(
+                    "🚫 **Nominatim blocked the request (HTTP 403).**\n\n"
+                    "OSM's Nominatim requires a valid User-Agent with real contact "
+                    "info, and blocks deployments that don't comply.\n\n"
+                    "**If you deployed on Streamlit Cloud:**\n"
+                    "1. Go to your app → Manage app → Settings → Secrets\n"
+                    "2. Add this line (use your real email):\n"
+                    "```\n"
+                    'CONTACT_EMAIL = "your.email@example.com"\n'
+                    "```\n"
+                    "3. Save → the app restarts automatically"
+                )
+            else:
+                st.error(f"Nominatim lookup failed: {err}")
+            return None
+        except Exception:
+            continue
+
+    if not valid_item:
+        return None
+
+    bbox = valid_item.get("boundingbox")
+    if not bbox or len(bbox) != 4:
+        return None
     try:
-        query = f"{city}, {county}, {state}, {country}"
-        params = {"q": query, "format": "json", "limit": 1, "addressdetails": 1}
-        data, _ = _nominatim_request("/search", params)
-        if not data:
-            return None
-        bbox = data[0].get("boundingbox")
-        if not bbox or len(bbox) != 4:
-            return None
         min_lat, max_lat = float(bbox[0]), float(bbox[1])
         min_lon, max_lon = float(bbox[2]), float(bbox[3])
-        lat_buf = (max_lat - min_lat) * 0.05
-        lon_buf = (max_lon - min_lon) * 0.05
-        result = {
-            "min_lat": min_lat - lat_buf,
-            "max_lat": max_lat + lat_buf,
-            "min_lon": min_lon - lon_buf,
-            "max_lon": max_lon + lon_buf,
-        }
-        if use_cache:
-            cache_set(key, result)
-        return result
-    except RuntimeError as e:
-        err = str(e)
-        if "403" in err:
-            st.error(
-                "🚫 **Nominatim blocked the request (HTTP 403).**\n\n"
-                "OSM's Nominatim requires a valid User-Agent with real contact "
-                "info, and blocks deployments that don't comply.\n\n"
-                "**If you deployed on Streamlit Cloud:**\n"
-                "1. Go to your app → Manage app → Settings → Secrets\n"
-                "2. Add this line (use your real email):\n"
-                "```\n"
-                'CONTACT_EMAIL = "your.email@example.com"\n'
-                "```\n"
-                "3. Save → the app restarts automatically\n\n"
-                "After this, your requests will identify who's running them, "
-                "and Nominatim will allow them."
-            )
+    except (ValueError, TypeError):
+        return None
+
+    # Adaptive buffer
+    lat_span = max_lat - min_lat
+    lon_span = max_lon - min_lon
+    lat_buf = max(lat_span * 0.08, 0.005)
+    lon_buf = max(lon_span * 0.08, 0.005)
+
+    result = {
+        "min_lat": min_lat - lat_buf,
+        "max_lat": max_lat + lat_buf,
+        "min_lon": min_lon - lon_buf,
+        "max_lon": max_lon + lon_buf,
+        "match_type": valid_item.get("type", ""),
+        "match_class": valid_item.get("class", ""),
+        "match_display": valid_item.get("display_name", ""),
+    }
+
+    # Extract polygon from GeoJSON if available — gives us precise city shape
+    geojson = valid_item.get("geojson", {})
+    if geojson:
+        polygon_points = _extract_polygon_points(geojson)
+        if polygon_points:
+            result["polygon"] = polygon_points
+
+    if use_cache:
+        cache_set(key, result)
+    return result
+
+
+def _extract_polygon_points(geojson):
+    """Convert GeoJSON geometry to a flat list of (lat, lon) tuples representing
+    the outer boundary. Handles Polygon and MultiPolygon types."""
+    geom_type = geojson.get("type", "")
+    coords = geojson.get("coordinates", [])
+    points = []
+    try:
+        if geom_type == "Polygon":
+            # coords[0] is the outer ring: [[lon, lat], [lon, lat], ...]
+            for lon, lat in coords[0]:
+                points.append((lat, lon))
+        elif geom_type == "MultiPolygon":
+            # Concatenate all outer rings (good enough for point-in-polygon)
+            for poly in coords:
+                for lon, lat in poly[0]:
+                    points.append((lat, lon))
         else:
-            st.error(f"Nominatim lookup failed: {err}")
+            return None
+    except (IndexError, TypeError, ValueError):
         return None
-    except Exception as e:
-        st.error(f"Error looking up city bbox: {e}")
-        return None
+    return points if len(points) >= 3 else None
+
+
+def point_in_polygon(lat, lon, polygon):
+    """Ray casting algorithm — returns True if (lat, lon) is inside polygon.
+    polygon is a list of (lat, lon) tuples."""
+    if not polygon or len(polygon) < 3:
+        return True  # no polygon — accept everything (bbox already filtered)
+    inside = False
+    n = len(polygon)
+    j = n - 1
+    for i in range(n):
+        lat_i, lon_i = polygon[i]
+        lat_j, lon_j = polygon[j]
+        if ((lon_i > lon) != (lon_j > lon)) and \
+           (lat < (lat_j - lat_i) * (lon - lon_i) / (lon_j - lon_i + 1e-12) + lat_i):
+            inside = not inside
+        j = i
+    return inside
 
 def in_bbox(lat, lon, bbox):
     return (bbox["min_lat"] <= lat <= bbox["max_lat"] and
@@ -919,39 +1038,112 @@ def reverse_geocode_all(entries, target_city, status_callback,
     status_callback(f"  Reverse geocoding complete")
 
 # ═══════════════════════════════════════════════════════════
-# FILTER BY CITY NAME
+# FILTER BY CITY NAME — generalized for any US city
 # ═══════════════════════════════════════════════════════════
-def filter_wrong_city(entries, target_city, status_callback):
-    """Remove facilities where the reverse-geocoded city is NOT the target city.
-    Uses ONLY city name (not zip codes) since zips overlap across cities."""
-    status_callback(f"Filtering facilities outside {target_city} by city name...")
-    target = target_city.lower()
+
+def get_city_neighborhoods(city, state, country="USA", use_cache=True):
+    """Fetch all suburbs/neighborhoods/boroughs that belong to a city via Nominatim.
+    For example, Alameda includes 'Bay Farm Island'; New York includes 'Manhattan',
+    'Brooklyn', etc. Returns a set of lowercase names that should be treated as
+    'inside the city'."""
+    key = _cache_key("city_neighborhoods", city, state, country)
+    if use_cache:
+        cached = cache_get(key)
+        if cached is not None:
+            return set(cached)
+
+    neighborhoods = {city.lower()}  # always include the city itself
+
+    # Nominatim search for suburbs within the city
+    try:
+        params = {
+            "q": f"{city}, {state}, {country}",
+            "format": "json", "limit": 10, "addressdetails": 1,
+            "extratags": 1, "namedetails": 1,
+        }
+        data, _ = _nominatim_request("/search", params)
+        for item in data:
+            addr = item.get("address", {})
+            # Anything Nominatim labels with our city as the parent counts
+            for key_name in ("city", "town", "village", "suburb",
+                              "neighbourhood", "borough", "city_district"):
+                v = addr.get(key_name, "").lower().strip()
+                if v and v == city.lower():
+                    # This item is within our target city — its name is a valid alias
+                    name = item.get("display_name", "").split(",")[0].lower().strip()
+                    if name and name != city.lower():
+                        neighborhoods.add(name)
+    except Exception:
+        pass  # neighborhoods are an enhancement, not required
+
+    if use_cache:
+        cache_set(key, list(neighborhoods))
+    return neighborhoods
+
+
+def filter_wrong_city(entries, target_city, target_state, bbox, status_callback,
+                       use_cache=True):
+    """Remove facilities that are NOT inside the target city.
+
+    Uses 3-tier validation:
+      1. POLYGON CHECK (most precise): if the city polygon is available,
+         test if the facility's coordinates are inside it. This is the
+         ground truth — if Nominatim said "this is the polygon for Alameda"
+         and a coordinate is inside, it's in Alameda regardless of what the
+         reverse-geocoded address says.
+      2. CITY NAME CHECK (backup): if no polygon, check verified_city /
+         address text against target city + known suburbs/neighborhoods.
+      3. KEEP-IF-UNCERTAIN: facilities with no info default to KEEP.
+    """
+    status_callback(f"Filtering facilities outside {target_city}...")
+    target = target_city.lower().strip()
+    polygon = bbox.get("polygon") if bbox else None
+
+    # Get city aliases for fallback name matching
+    valid_aliases = get_city_neighborhoods(target_city, target_state,
+                                            use_cache=use_cache)
+
+    if polygon:
+        status_callback(f"  Using city polygon ({len(polygon)} points) "
+                        f"for precise inside/outside check")
+    else:
+        status_callback(f"  No polygon — using city name matching only")
+
+    if len(valid_aliases) > 1:
+        sample = ", ".join(sorted(valid_aliases))[:80]
+        status_callback(f"  Recognizing {len(valid_aliases)} aliases: {sample}")
+
     filtered = []
     removed = []
 
     for entry in entries:
+        lat = entry.get("lat")
+        lon = entry.get("lon")
         v_city = entry.get("verified_city", "").lower().strip()
         address = entry.get("address", "").lower()
 
-        # Check 1: verified_city from reverse geocode
-        if v_city:
-            if target in v_city:
+        # TIER 1: Polygon check is authoritative when available
+        if polygon and lat and lon:
+            if point_in_polygon(lat, lon, polygon):
                 filtered.append(entry)
                 continue
-            # Different city — remove
+            else:
+                removed.append(f"{entry['name']} (outside city polygon)")
+                continue
+
+        # TIER 2: City name match
+        # Match if verified_city or address contains any valid alias
+        text_to_check = f"{v_city} {address}"
+        if any(alias in text_to_check for alias in valid_aliases):
+            filtered.append(entry)
+            continue
+
+        # TIER 3: If we have a verified_city that's clearly different,
+        # remove. Otherwise keep (benefit of the doubt).
+        if v_city and v_city not in target and target not in v_city:
             removed.append(f"{entry['name']} (city: {v_city})")
             continue
 
-        # Check 2: city name in address string
-        if address:
-            if target in address:
-                filtered.append(entry)
-                continue
-            # No target city in address — likely wrong
-            removed.append(f"{entry['name']} (address: {address[:60]})")
-            continue
-
-        # No info — keep
         filtered.append(entry)
 
     status_callback(f"Removed {len(removed)} facilities outside {target_city}")
@@ -1299,97 +1491,91 @@ def main():
     sport_config = SPORTS_CONFIG[sport_choice]
     log_messages = []
 
-    log_container = st.container()
-    progress_bar = st.progress(0)
-
+    # Background log collector (hidden by default — user can expand later)
     def log(msg):
         log_messages.append(msg)
-        with log_container:
-            st.code("\n".join(log_messages[-20:]), language="text")
 
-    # Step 1: Get city bounding box
-    progress_bar.progress(5, text="Looking up city boundaries...")
-    log(f"[1/6] Looking up bounding box for {city}, {county}, {state}...")
-    bbox = lookup_city_bbox(city, county, state, country, use_cache=use_cache)
-    if not bbox:
-        st.error(f"Could not find bounding box for '{city}, {county}, {state}'. "
-                 "Check spelling and try again.")
-        return
-    log(f"  Bbox: lat [{bbox['min_lat']:.4f}, {bbox['max_lat']:.4f}], "
-        f"lon [{bbox['min_lon']:.4f}, {bbox['max_lon']:.4f}]")
+    # Use a single status spinner that shows current step
+    status = st.status("🍳 Cooking up your sports facility data...",
+                        expanded=False)
 
-    # Detect local Overpass / Nominatim from URL
-    is_local_overpass = ("localhost" in overpass_url or
-                         "127.0.0.1" in overpass_url)
+    with status:
+        st.write("Looking up city boundaries...")
 
-    # Step 2: Fetch from sources (parallel for Overpass)
-    progress_bar.progress(15, text="Fetching from Overpass API (parallel)...")
-    log(f"\n[2/6] Fetching from Overpass API...")
-    t0 = time.time()
-    overpass_results = fetch_overpass(bbox, sport_config, overpass_url, log,
-                                       is_local=is_local_overpass,
-                                       use_cache=use_cache)
-    log(f"  ⏱️ Overpass took {time.time() - t0:.1f}s")
+        bbox = lookup_city_bbox(city, county, state, country, use_cache=use_cache)
+        if not bbox:
+            status.update(label="❌ City not found", state="error")
+            st.error(
+                f"Could not find a city named '{city}' in '{county}, {state}'.\n\n"
+                "**Things to check:**\n"
+                f"- Spelling of city name (try variations like '{city} City' or 'City of {city}')\n"
+                "- County name should include the word 'County' (e.g., 'Alameda County')\n"
+                "- For ambiguous names, try a more specific city — e.g., 'Alameda, Alameda County, CA'\n"
+                "- Some cities aren't in OpenStreetMap; try a nearby major city instead"
+            )
+            return
+        log(f"[1/6] Bbox: lat [{bbox['min_lat']:.4f}, {bbox['max_lat']:.4f}], "
+            f"lon [{bbox['min_lon']:.4f}, {bbox['max_lon']:.4f}]")
+        if bbox.get("match_display"):
+            log(f"  Matched: {bbox['match_display'][:80]}")
+        if bbox.get("polygon"):
+            log(f"  Got city polygon: {len(bbox['polygon'])} points")
 
-    # If Overpass entirely failed, show an informational warning (not fatal —
-    # Nominatim may still return enough results)
-    # if len(overpass_results) == 0:
-    #     st.warning(
-    #         "⚠️ **Overpass API is unavailable right now.** Falling back to "
-    #         "Nominatim-only results (which usually still finds most parks, "
-    #         "schools, and rec centers, but may miss some smaller facilities).\n\n"
-    #         "If you need complete data:\n"
-    #         "- Run the app **locally** — `streamlit run sports_facility_finder.py`\n"
-    #         "- Or self-host Overpass (see OVERPASS_LOCAL_SETUP.md)"
-    #     )
+        is_local_overpass = ("localhost" in overpass_url or
+                             "127.0.0.1" in overpass_url)
 
-    progress_bar.progress(40, text="Fetching from Nominatim...")
-    log(f"\n[3/6] Fetching from Nominatim Search...")
-    t0 = time.time()
-    nominatim_results = fetch_nominatim(city, state, bbox, sport_config, log,
-                                         use_cache=use_cache)
-    log(f"  ⏱️ Nominatim search took {time.time() - t0:.1f}s")
+        st.write("Searching Overpass API for sports facilities...")
+        t0 = time.time()
+        overpass_results = fetch_overpass(bbox, sport_config, overpass_url, log,
+                                           is_local=is_local_overpass,
+                                           use_cache=use_cache)
+        log(f"[2/6] Overpass took {time.time() - t0:.1f}s, "
+            f"{len(overpass_results)} results")
 
-    all_results = overpass_results + nominatim_results
+        st.write("Searching Nominatim for facility names...")
+        t0 = time.time()
+        nominatim_results = fetch_nominatim(city, state, bbox, sport_config, log,
+                                             use_cache=use_cache)
+        log(f"[3/6] Nominatim took {time.time() - t0:.1f}s, "
+            f"{len(nominatim_results)} results")
 
-    # Step 3: Merge
-    progress_bar.progress(55, text="Merging and deduplicating...")
-    log(f"\n[4/6] Merging and deduplicating...")
-    merged = merge_and_deduplicate(all_results, sport_config, log)
+        all_results = overpass_results + nominatim_results
 
-    if not merged:
-        st.warning("No facilities found. Try a different city or sport.")
-        progress_bar.empty()
-        return
+        st.write("Merging and deduplicating results...")
+        merged = merge_and_deduplicate(all_results, sport_config, log)
 
-    # Step 4: Reverse geocode (parallel for local Nominatim)
-    progress_bar.progress(70, text="Reverse geocoding addresses...")
-    log(f"\n[5/6] Reverse geocoding for addresses + city verification...")
-    t0 = time.time()
-    reverse_geocode_all(merged, city, log, use_local_nominatim=False,
-                         use_cache=use_cache)
-    log(f"  ⏱️ Reverse geocoding took {time.time() - t0:.1f}s")
+        if not merged:
+            status.update(label="No facilities found", state="error")
+            st.warning("No facilities found. Try a different city or sport.")
+            return
 
-    # Step 5: Filter by city name
-    progress_bar.progress(85, text=f"Filtering to only {city}...")
-    log(f"\n[6/6] Filtering facilities by city name...")
-    filtered, removed_list = filter_wrong_city(merged, city, log)
+        st.write("Geocoding addresses...")
+        t0 = time.time()
+        reverse_geocode_all(merged, city, log, use_local_nominatim=False,
+                             use_cache=use_cache)
+        log(f"[5/6] Reverse geocoding took {time.time() - t0:.1f}s")
 
-    if not filtered:
-        st.warning(f"No facilities found inside {city} after filtering.")
-        progress_bar.empty()
-        return
+        st.write(f"Filtering to facilities inside {city}...")
+        filtered, removed_list = filter_wrong_city(merged, city, state, bbox, log,
+                                                      use_cache=use_cache)
 
-    # Step 6: Categorize and build Excel
-    categories = categorize(filtered, sport_config, log)
-    cat_summary = ", ".join(f"{k.split()[0].title()}: {len(v)}"
-                             for k, v in categories.items() if v)
-    log(f"  Categories: {cat_summary}")
+        if not filtered:
+            status.update(label="No facilities inside city", state="error")
+            st.warning(f"No facilities found inside {city} after filtering.")
+            return
 
-    progress_bar.progress(95, text="Building Excel file...")
-    excel_buffer, total = build_excel(categories, sport_config, city, state)
-    progress_bar.progress(100, text="Done!")
-    progress_bar.empty()
+        st.write("Building your Excel file...")
+        categories = categorize(filtered, sport_config, log)
+        excel_buffer, total = build_excel(categories, sport_config, city, state)
+
+        status.update(label=f"✅ Done! Found {total} facilities", state="complete")
+
+    # Show post-warnings outside the spinner
+    if len(overpass_results) == 0:
+        st.warning(
+            "⚠️ **Overpass API was unavailable** — fell back to Nominatim only. "
+            "May have missed some smaller facilities. Run locally for full data."
+        )
 
     # Display results
     st.success(f"✅ Found **{total}** {sport_config['facility_label'].lower()} entries "
@@ -1428,6 +1614,10 @@ def main():
                 "Width (ft)": row.get("width_ft") or "N/A",
             })
     st.dataframe(preview_data, use_container_width=True, hide_index=True)
+
+    # Detailed log (hidden by default)
+    with st.expander("🔍 View detailed log"):
+        st.code("\n".join(log_messages), language="text")
 
     # Download button
     filename = f"{city.replace(' ', '_')}_{sport_choice.replace(' / ', '_').replace(' ', '_')}.xlsx"

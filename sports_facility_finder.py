@@ -96,8 +96,10 @@ def _cache_key(prefix, *args):
     raw = prefix + "|" + "|".join(str(a) for a in args)
     return hashlib.sha256(raw.encode()).hexdigest()
 
-def cache_get(key):
-    """Get a cached value, or None if missing/expired."""
+def cache_get(key, max_age_seconds=None):
+    """Get a cached value. Returns None if missing or expired.
+    If max_age_seconds is given, override the default TTL."""
+    ttl = max_age_seconds if max_age_seconds is not None else CACHE_TTL_SECONDS
     with _cache_lock:
         with sqlite3.connect(CACHE_DB_PATH) as conn:
             row = conn.execute(
@@ -106,7 +108,7 @@ def cache_get(key):
             if not row:
                 return None
             value, created_at = row
-            if time.time() - created_at > CACHE_TTL_SECONDS:
+            if time.time() - created_at > ttl:
                 return None
             try:
                 return json.loads(value)
@@ -114,13 +116,20 @@ def cache_get(key):
                 return None
 
 def cache_set(key, value):
-    """Store a value in the cache."""
+    """Store a value in the cache with default TTL."""
     with _cache_lock:
         with sqlite3.connect(CACHE_DB_PATH) as conn:
             conn.execute(
                 "INSERT OR REPLACE INTO api_cache (key, value, created_at) VALUES (?, ?, ?)",
                 (key, json.dumps(value), int(time.time())),
             )
+
+
+def _cache_set_with_ttl(key, value, ttl_seconds):
+    """Store a short-lived value. Since all entries use the same table, we
+    just set it with the current timestamp — the consumer must call
+    cache_get(key, max_age_seconds=ttl_seconds) to enforce the shorter TTL."""
+    cache_set(key, value)
 
 def cache_clear():
     """Delete all cached entries."""
@@ -593,55 +602,66 @@ def query_overpass(name, query, overpass_url, status_callback, breaker,
     return name, []
 
 
-def probe_overpass(overpass_url, status_callback, timeout=10):
-    """Quick health check — send a trivial query that should return instantly.
-    If it fails, we know the Overpass endpoint is unavailable and skip all
-    real queries (saving minutes of wasted retries)."""
-    # Trivial query: return 1 node from a tiny bbox
-    probe_query = "[out:json][timeout:5];node(0,0,0.001,0.001);out count;"
-    mirror_name = (overpass_url.split("//")[1].split("/")[0]
-                    if "//" in overpass_url else overpass_url)
-    status_callback(f"  Probing {mirror_name}...")
+def probe_overpass(overpass_url, timeout=5):
+    """Send a trivial query to check if endpoint is responsive.
+    Returns (url, success, reason). No logging — caller decides what to print."""
+    probe_query = "[out:json][timeout:3];node(0,0,0.001,0.001);out count;"
+    resp = None
     try:
         resp = requests.post(overpass_url, data={"data": probe_query},
                              timeout=timeout, headers=HEADERS)
         resp.raise_for_status()
-        status_callback(f"  ✅ {mirror_name} is responsive")
-        return True
+        return overpass_url, True, "ok"
     except requests.exceptions.HTTPError:
         status = resp.status_code if resp is not None else 0
-        status_callback(f"  ❌ {mirror_name} returned HTTP {status}")
-        return False
+        return overpass_url, False, f"HTTP {status}"
     except requests.exceptions.Timeout:
-        status_callback(f"  ❌ {mirror_name} timed out after {timeout}s")
-        return False
+        return overpass_url, False, f"timeout"
     except requests.exceptions.ConnectionError:
-        status_callback(f"  ❌ {mirror_name} connection refused")
-        return False
+        return overpass_url, False, "refused"
     except Exception as e:
-        status_callback(f"  ❌ {mirror_name} error: {type(e).__name__}")
-        return False
+        return overpass_url, False, type(e).__name__
 
 
 def pick_working_overpass(preferred_url, status_callback, is_local=False):
-    """Given a preferred URL, probe it. If it fails AND it's a public URL,
-    probe each mirror in order. Return the first working URL, or None if
-    all fail."""
+    """Probe ALL candidate endpoints IN PARALLEL. First one to respond wins.
+    This cuts worst-case delay from 40s (sequential 4 mirrors × 10s) to ~5s
+    (all probed concurrently, first to succeed is used)."""
     if is_local:
-        # Local URL — only try it, no mirror fallback
-        if probe_overpass(preferred_url, status_callback):
-            return preferred_url
-        return None
+        # Local URL — only try it
+        url, ok, reason = probe_overpass(preferred_url, timeout=5)
+        name = url.split("//")[1].split("/")[0] if "//" in url else url
+        if ok:
+            status_callback(f"  ✅ {name} responsive")
+            return url
+        else:
+            status_callback(f"  ❌ {name} {reason}")
+            return None
 
-    # Public URL — try preferred first, then mirrors
+    # Public — probe preferred + all mirrors in parallel, take first success
     urls_to_try = [preferred_url]
     for mirror in OVERPASS_MIRRORS:
         if mirror != preferred_url:
             urls_to_try.append(mirror)
 
-    for url in urls_to_try:
-        if probe_overpass(url, status_callback):
-            return url
+    status_callback(f"  Probing {len(urls_to_try)} endpoints in parallel...")
+
+    with ThreadPoolExecutor(max_workers=len(urls_to_try)) as executor:
+        # Submit all probes simultaneously
+        futures = {executor.submit(probe_overpass, url, 5): url for url in urls_to_try}
+        # as_completed yields results as they finish — first success wins
+        for future in as_completed(futures):
+            url, ok, reason = future.result()
+            name = url.split("//")[1].split("/")[0] if "//" in url else url
+            if ok:
+                status_callback(f"  ✅ {name} responsive (using this)")
+                # Cancel remaining probes (they're still running but we don't care)
+                for f in futures:
+                    f.cancel()
+                return url
+            else:
+                status_callback(f"  ❌ {name} {reason}")
+
     return None
 
 
@@ -661,17 +681,31 @@ def fetch_overpass(bbox, sport_config, overpass_url, status_callback,
 
     status_callback(f"Source 1: Overpass API ({'LOCAL' if is_local_url else 'PUBLIC'})...")
 
-    # Step 1: Probe to find a working endpoint
-    status_callback("  Quick health check (max 10s per mirror)...")
-    working_url = pick_working_overpass(overpass_url, status_callback,
-                                          is_local=is_local_url)
-    if working_url is None:
-        status_callback("  ⚠️  No Overpass endpoint responded. "
-                        "Skipping Overpass entirely — using Nominatim only.")
-        return []
+    # Step 1: Find a working endpoint — use a 5-minute cache to skip re-probing
+    # on every search when you're searching multiple cities back-to-back.
+    PROBE_CACHE_TTL = 300  # 5 minutes
+    probe_cache_key = _cache_key("overpass_probe_ok", overpass_url)
+    cached_working = None
+    if use_cache:
+        cached_working = cache_get(probe_cache_key, max_age_seconds=PROBE_CACHE_TTL)
+
+    if cached_working:
+        working_url = cached_working
+        status_callback(f"  💾 Using cached working endpoint: "
+                        f"{working_url.split('//')[1].split('/')[0]}")
+    else:
+        working_url = pick_working_overpass(overpass_url, status_callback,
+                                              is_local=is_local_url)
+        if working_url is None:
+            status_callback("  ⚠️  No Overpass endpoint responded. "
+                            "Skipping Overpass — using Nominatim only.")
+            return []
+        if use_cache:
+            # Cache short-term (5 min) — mirror health changes over hours
+            _cache_set_with_ttl(probe_cache_key, working_url, PROBE_CACHE_TTL)
 
     if working_url != overpass_url:
-        status_callback(f"  ℹ️ Falling back to {working_url}")
+        status_callback(f"  ℹ️ Using fallback mirror")
 
     # Step 2: Actual queries with circuit breaker
     max_workers = 6 if is_local_url else 3

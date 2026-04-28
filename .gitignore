@@ -1,0 +1,18 @@
+# Streamlit secrets — NEVER commit this to GitHub
+.streamlit/secrets.toml
+ 
+# Local SQLite cache
+facility_cache.db
+*.db
+ 
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.env
+venv/
+.venv/
+ 
+# OS
+.DS_Store
+Thumbs.db

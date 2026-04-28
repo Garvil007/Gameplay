@@ -1,9 +1,7 @@
 [server]
-fileWatcherType = "none"
-runOnSave = false
+headless = true
+enableCORS = false
+enableXsrfProtection = false
 
 [browser]
 gatherUsageStats = false
-
-[global]
-developmentMode = false

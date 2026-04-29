@@ -1115,33 +1115,82 @@ def get_city_neighborhoods(city, state, country="USA", use_cache=True):
     return neighborhoods
 
 
+def _parse_city_from_address(address):
+    """Extract the city name from an address string.
+
+    Handles common US address formats:
+      - "123 Main St, Newark, CA 94560"       → "newark"
+      - "Enterprise Drive, Newark, CA 94560"  → "newark"
+      - "37701 Spring Tide Road, Newark"       → "newark"
+      - "40000 Paseo Padre Parkway, Fremont"  → "fremont"
+
+    Strategy: split on commas, then scan each part for a token that looks
+    like a city name (not a street number, not a state abbreviation, not a
+    zip code, not empty). Returns lowercase city string or "" if not found.
+    """
+    if not address:
+        return ""
+
+    parts = [p.strip() for p in address.split(",")]
+    # We need at least 2 parts: [street, city] or [street, city, state+zip]
+    if len(parts) < 2:
+        return ""
+
+    # Walk parts from index 1 onward (skip the street/number in parts[0])
+    for part in parts[1:]:
+        part = part.strip()
+        if not part:
+            continue
+        # Skip pure zip codes (5 digits, or 5+4 digits)
+        if re.match(r"^\d{5}(-\d{4})?$", part):
+            continue
+        # Skip US state abbreviations (2 uppercase letters, optionally followed by zip)
+        if re.match(r"^[A-Z]{2}(\s+\d{5}(-\d{4})?)?$", part):
+            continue
+        # Skip tokens that are only numbers
+        if re.match(r"^\d+$", part):
+            continue
+        # Skip "USA" / "United States"
+        if part.lower() in ("usa", "united states", "us"):
+            continue
+        # This part looks like a city name — strip any trailing state/zip that
+        # got merged into the same comma segment (e.g. "Newark CA 94560")
+        city_token = re.split(r"\s+[A-Z]{2}\s+\d{5}", part)[0].strip()
+        if city_token:
+            return city_token.lower()
+
+    return ""
+
+
 def filter_wrong_city(entries, target_city, target_state, bbox, status_callback,
                        use_cache=True):
     """Remove facilities that are NOT inside the target city.
 
     Uses 3-tier validation:
-      1. POLYGON CHECK (most precise): if the city polygon is available,
-         test if the facility's coordinates are inside it. This is the
-         ground truth — if Nominatim said "this is the polygon for Alameda"
-         and a coordinate is inside, it's in Alameda regardless of what the
-         reverse-geocoded address says.
-      2. CITY NAME CHECK (backup): if no polygon, check verified_city /
-         address text against target city + known suburbs/neighborhoods.
-      3. KEEP-IF-UNCERTAIN: facilities with no info default to KEEP.
+      1. ADDRESS CITY CHECK (primary): parse the city name out of the
+         facility's address string. If the address clearly names a different
+         city, remove the facility. This is the most reliable signal because
+         the address already contains the city — e.g. "Newark, CA 94560"
+         tells us unambiguously this is not a Fremont facility.
+      2. POLYGON CHECK (when polygon is available): if the city polygon was
+         returned by Nominatim, use it as a precise inside/outside check for
+         facilities whose address city could not be determined.
+      3. VERIFIED_CITY / KEEP-IF-UNCERTAIN: last resort — if reverse geocode
+         populated verified_city, use that. Otherwise keep (benefit of doubt).
     """
     status_callback(f"Filtering facilities outside {target_city}...")
     target = target_city.lower().strip()
     polygon = bbox.get("polygon") if bbox else None
 
-    # Get city aliases for fallback name matching
+    # Get city aliases (e.g. historic neighborhoods that are part of the city)
     valid_aliases = get_city_neighborhoods(target_city, target_state,
                                             use_cache=use_cache)
 
     if polygon:
         status_callback(f"  Using city polygon ({len(polygon)} points) "
-                        f"for precise inside/outside check")
+                        f"as secondary check")
     else:
-        status_callback(f"  No polygon — using city name matching only")
+        status_callback(f"  No polygon available — using address + verified_city")
 
     if len(valid_aliases) > 1:
         sample = ", ".join(sorted(valid_aliases))[:80]
@@ -1154,9 +1203,26 @@ def filter_wrong_city(entries, target_city, target_state, bbox, status_callback,
         lat = entry.get("lat")
         lon = entry.get("lon")
         v_city = entry.get("verified_city", "").lower().strip()
-        address = entry.get("address", "").lower()
+        address = entry.get("address", "")
 
-        # TIER 1: Polygon check is authoritative when available
+        # ── TIER 1: Address city check ──────────────────────────────────────
+        # Parse the city out of the address string directly.
+        # Example: "Enterprise Drive, Newark, CA 94560" → "newark"
+        address_city = _parse_city_from_address(address)
+
+        if address_city:
+            # Check if the address city matches the target or any of its aliases
+            if address_city in valid_aliases or target in address_city or address_city in target:
+                filtered.append(entry)
+                continue
+            else:
+                # Address explicitly names a different city — remove it
+                removed.append(
+                    f"{entry['name']} (address city: '{address_city}' ≠ '{target}')"
+                )
+                continue
+
+        # ── TIER 2: Polygon check (for entries where address city is unknown) ─
         if polygon and lat and lon:
             if point_in_polygon(lat, lon, polygon):
                 filtered.append(entry)
@@ -1165,19 +1231,16 @@ def filter_wrong_city(entries, target_city, target_state, bbox, status_callback,
                 removed.append(f"{entry['name']} (outside city polygon)")
                 continue
 
-        # TIER 2: City name match
-        # Match if verified_city or address contains any valid alias
-        text_to_check = f"{v_city} {address}"
-        if any(alias in text_to_check for alias in valid_aliases):
-            filtered.append(entry)
+        # ── TIER 3: verified_city or keep-if-uncertain ──────────────────────
+        # Use the reverse-geocoded city if available
+        if v_city:
+            if v_city in valid_aliases or target in v_city or v_city in target:
+                filtered.append(entry)
+            else:
+                removed.append(f"{entry['name']} (verified city: '{v_city}' ≠ '{target}')")
             continue
 
-        # TIER 3: If we have a verified_city that's clearly different,
-        # remove. Otherwise keep (benefit of the doubt).
-        if v_city and v_city not in target and target not in v_city:
-            removed.append(f"{entry['name']} (city: {v_city})")
-            continue
-
+        # No address city, no polygon, no verified_city — keep as uncertain
         filtered.append(entry)
 
     status_callback(f"Removed {len(removed)} facilities outside {target_city}")

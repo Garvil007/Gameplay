@@ -1,24 +1,3 @@
-"""
-US Sports Facility Finder — Streamlit App
-==========================================
-Discovers sports facilities (soccer, baseball, basketball, tennis, volleyball,
-football) in any US city using free APIs:
-  1. Overpass API (OpenStreetMap)
-  2. Nominatim Search/Reverse Geocoding API
-
-Filters facilities precisely by checking the city name in the
-reverse-geocoded address (handles cities with irregular shapes
-where zip codes overlap into neighboring cities).
-
-Outputs a formatted Excel file matching the standard template.
-
-Requirements:
-    pip install streamlit requests openpyxl
-
-Usage:
-    streamlit run sports_facility_finder.py
-"""
-
 import re
 import time
 import math
@@ -29,58 +8,44 @@ import sqlite3
 import os
 import requests
 import streamlit as st
+from dotenv import load_dotenv
+
+load_dotenv()
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from threading import Lock
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 
-# ═══════════════════════════════════════════════════════════
-# CONFIG
-# ═══════════════════════════════════════════════════════════
-# Multiple public Overpass mirror endpoints. If the first fails, we fall back
-# to others. This helps when one mirror is rate-limiting your IP (common on
-# Streamlit Cloud, PythonAnywhere, and other shared hosting).
 OVERPASS_MIRRORS = [
-    "https://overpass-api.de/api/interpreter",          # Main instance
-    "https://overpass.kumi.systems/api/interpreter",    # Kumi.systems mirror
-    "https://overpass.osm.ch/api/interpreter",          # Swiss OSM mirror
-    "https://overpass.openstreetmap.fr/api/interpreter", # French OSM mirror
+    "https://overpass-api.de/api/interpreter",
+    "https://overpass.kumi.systems/api/interpreter",
+    "https://overpass.osm.ch/api/interpreter",
+    "https://overpass.openstreetmap.fr/api/interpreter",
 ]
 DEFAULT_OVERPASS_URL = OVERPASS_MIRRORS[0]
 
 NOMINATIM_URL = "https://nominatim.openstreetmap.org"
 
-# Nominatim's usage policy REQUIRES a descriptive User-Agent. Fake URLs or
-# emails get blocked with HTTP 403. You can override via env var CONTACT_EMAIL
-# in Streamlit Cloud Secrets to put your real email here.
 _CONTACT = os.environ.get("CONTACT_EMAIL", "")
 if _CONTACT:
     USER_AGENT = f"SportsFacilityFinder/1.0 ({_CONTACT})"
 else:
-    # Fallback: just the app name + version, no fake contact info.
-    # This is less preferred by Nominatim but often still accepted.
     USER_AGENT = "SportsFacilityFinder/1.0"
 
-# Use a browser-like Accept header too
 HEADERS = {
     "User-Agent": USER_AGENT,
     "Accept": "application/json",
     "Accept-Language": "en-US,en;q=0.9",
 }
 
-# Thread-safe lock for log messages from worker threads
 _log_lock = Lock()
 
-# ═══════════════════════════════════════════════════════════
-# SQLITE CACHE — avoids re-querying same data
-# ═══════════════════════════════════════════════════════════
 CACHE_DB_PATH = "facility_cache.db"
-CACHE_TTL_SECONDS = 7 * 24 * 3600  # 7 days
+CACHE_TTL_SECONDS = 7 * 24 * 3600
 
 _cache_lock = Lock()
 
 def _init_cache():
-    """Create cache tables if they don't exist."""
     with sqlite3.connect(CACHE_DB_PATH) as conn:
         conn.execute("""
             CREATE TABLE IF NOT EXISTS api_cache (
@@ -92,13 +57,10 @@ def _init_cache():
         conn.execute("CREATE INDEX IF NOT EXISTS idx_created ON api_cache(created_at)")
 
 def _cache_key(prefix, *args):
-    """Build a cache key from a prefix + arguments."""
     raw = prefix + "|" + "|".join(str(a) for a in args)
     return hashlib.sha256(raw.encode()).hexdigest()
 
 def cache_get(key, max_age_seconds=None):
-    """Get a cached value. Returns None if missing or expired.
-    If max_age_seconds is given, override the default TTL."""
     ttl = max_age_seconds if max_age_seconds is not None else CACHE_TTL_SECONDS
     with _cache_lock:
         with sqlite3.connect(CACHE_DB_PATH) as conn:
@@ -116,7 +78,6 @@ def cache_get(key, max_age_seconds=None):
                 return None
 
 def cache_set(key, value):
-    """Store a value in the cache with default TTL."""
     with _cache_lock:
         with sqlite3.connect(CACHE_DB_PATH) as conn:
             conn.execute(
@@ -124,21 +85,15 @@ def cache_set(key, value):
                 (key, json.dumps(value), int(time.time())),
             )
 
-
 def _cache_set_with_ttl(key, value, ttl_seconds):
-    """Store a short-lived value. Since all entries use the same table, we
-    just set it with the current timestamp — the consumer must call
-    cache_get(key, max_age_seconds=ttl_seconds) to enforce the shorter TTL."""
     cache_set(key, value)
 
 def cache_clear():
-    """Delete all cached entries."""
     with _cache_lock:
         with sqlite3.connect(CACHE_DB_PATH) as conn:
             conn.execute("DELETE FROM api_cache")
 
 def cache_stats():
-    """Return (count, size_bytes) of cache."""
     if not os.path.exists(CACHE_DB_PATH):
         return 0, 0
     with _cache_lock:
@@ -149,8 +104,6 @@ def cache_stats():
 
 _init_cache()
 
-# Sport configurations: each sport has its own OSM tag values, keywords,
-# excluded keywords, default description, and default category sections.
 SPORTS_CONFIG = {
     "Soccer / Football": {
         "osm_sports": ["soccer", "football"],
@@ -165,6 +118,7 @@ SPORTS_CONFIG = {
             "multi": "Multi-Purpose Field (Soccer)",
         },
         "section_keywords": ["park", "field", "sports", "recreation"],
+        "min_pitch_length_ft": 180,
     },
     "Baseball / Softball": {
         "osm_sports": ["baseball", "softball"],
@@ -178,6 +132,7 @@ SPORTS_CONFIG = {
             "both": "Baseball/Softball Field",
         },
         "section_keywords": ["park", "field", "diamond"],
+        "min_pitch_length_ft": 200,
     },
     "Basketball": {
         "osm_sports": ["basketball"],
@@ -193,6 +148,7 @@ SPORTS_CONFIG = {
             "full": "Full Court",
         },
         "section_keywords": ["park", "court", "gym", "recreation"],
+        "min_pitch_length_ft": 42,
     },
     "Tennis": {
         "osm_sports": ["tennis"],
@@ -202,6 +158,7 @@ SPORTS_CONFIG = {
         "facility_label": "Tennis Court",
         "label_variants": {},
         "section_keywords": ["park", "court", "tennis", "club"],
+        "min_pitch_length_ft": 75,
     },
     "Volleyball": {
         "osm_sports": ["volleyball", "beachvolleyball"],
@@ -213,12 +170,17 @@ SPORTS_CONFIG = {
             "beach": "Beach Volleyball Court",
         },
         "section_keywords": ["park", "court", "beach", "gym"],
+        "min_pitch_length_ft": 55,
     },
 }
 
-# ═══════════════════════════════════════════════════════════
-# HELPERS
-# ═══════════════════════════════════════════════════════════
+_TOO_SMALL_NAME_FRAGMENTS = [
+    "tot lot", "tot-lot", "toddler", "mini park", "mini-park",
+    "pocket park", "dog park", "dog run", "skate park", "skatepark",
+    "splash pad", "spray park", "butterfly garden", "community garden",
+    "meditation garden", "memorial garden", "rose garden",
+]
+
 def haversine(lat1, lon1, lat2, lon2):
     R = 6371000
     p = math.pi / 180
@@ -260,33 +222,21 @@ def normalize_key(name):
             n = n[:-len(suffix)].strip()
     return re.sub(r"[^a-z0-9]", "", n)
 
-# ═══════════════════════════════════════════════════════════
-# CITY BOUNDING BOX LOOKUP
-# ═══════════════════════════════════════════════════════════
-
-# Alternative Nominatim endpoints to try if the main one blocks us.
-# Note: these are not 1:1 mirrors — they may have different data/freshness,
-# but they all support the same /search and /reverse endpoints.
 NOMINATIM_MIRRORS = [
     "https://nominatim.openstreetmap.org",
-    "https://nominatim.openstreetmap.de",  # German OSMF mirror
+    "https://nominatim.openstreetmap.de",
 ]
 
-
 def _nominatim_request(path, params, timeout=20):
-    """Try each Nominatim mirror in order. Returns (response_data, url_used)
-    or raises an exception on complete failure."""
     last_error = None
     for url in NOMINATIM_MIRRORS:
         try:
             resp = requests.get(f"{url}{path}", params=params,
                                 headers=HEADERS, timeout=timeout)
             if resp.status_code == 403:
-                # Blocked — try next mirror
                 last_error = f"{url}: 403 Forbidden (User-Agent rejected)"
                 continue
             if resp.status_code == 429:
-                # Rate limited — try next mirror
                 last_error = f"{url}: 429 rate limited"
                 continue
             resp.raise_for_status()
@@ -306,20 +256,7 @@ def _nominatim_request(path, params, timeout=20):
 
     raise RuntimeError(f"All Nominatim mirrors failed. Last error: {last_error}")
 
-
 def lookup_city_bbox(city, county, state="California", country="USA", use_cache=True):
-    """Find the bounding box AND polygon for a city using Nominatim.
-
-    Returns dict with min_lat/max_lat/min_lon/max_lon (bbox) and optionally
-    'polygon' (list of (lat, lon) points forming the city outline) for
-    precise point-in-polygon checks later.
-
-    Strategies (tried in order until one returns a valid city result):
-      1. Structured query (city + county + state + country)
-      2. Free-form query "city, county, state, country"
-      3. Free-form query "city, state, country"
-      4. Free-form query "city, state"
-    """
     key = _cache_key("city_bbox_v2", city, county, state, country)
     if use_cache:
         cached = cache_get(key)
@@ -344,12 +281,10 @@ def lookup_city_bbox(city, county, state="California", country="USA", use_cache=
             return False
         return True
 
-    # Build query strategies — request GeoJSON polygon (polygon_geojson=1)
     strategies = []
     base_params = {"format": "json", "limit": 5, "addressdetails": 1,
                     "polygon_geojson": 1}
 
-    # 1. Structured query
     structured = {**base_params, "city": city, "country": country}
     if state:
         structured["state"] = state
@@ -357,7 +292,6 @@ def lookup_city_bbox(city, county, state="California", country="USA", use_cache=
         structured["county"] = county
     strategies.append(("structured", structured))
 
-    # 2-4. Free-form variants
     if county:
         strategies.append(("free-form full",
             {**base_params, "q": f"{city}, {county}, {state}, {country}"}))
@@ -411,7 +345,6 @@ def lookup_city_bbox(city, county, state="California", country="USA", use_cache=
     except (ValueError, TypeError):
         return None
 
-    # Adaptive buffer
     lat_span = max_lat - min_lat
     lon_span = max_lon - min_lon
     lat_buf = max(lat_span * 0.08, 0.005)
@@ -427,7 +360,6 @@ def lookup_city_bbox(city, county, state="California", country="USA", use_cache=
         "match_display": valid_item.get("display_name", ""),
     }
 
-    # Extract polygon from GeoJSON if available — gives us precise city shape
     geojson = valid_item.get("geojson", {})
     if geojson:
         polygon_points = _extract_polygon_points(geojson)
@@ -438,20 +370,15 @@ def lookup_city_bbox(city, county, state="California", country="USA", use_cache=
         cache_set(key, result)
     return result
 
-
 def _extract_polygon_points(geojson):
-    """Convert GeoJSON geometry to a flat list of (lat, lon) tuples representing
-    the outer boundary. Handles Polygon and MultiPolygon types."""
     geom_type = geojson.get("type", "")
     coords = geojson.get("coordinates", [])
     points = []
     try:
         if geom_type == "Polygon":
-            # coords[0] is the outer ring: [[lon, lat], [lon, lat], ...]
             for lon, lat in coords[0]:
                 points.append((lat, lon))
         elif geom_type == "MultiPolygon":
-            # Concatenate all outer rings (good enough for point-in-polygon)
             for poly in coords:
                 for lon, lat in poly[0]:
                     points.append((lat, lon))
@@ -461,12 +388,9 @@ def _extract_polygon_points(geojson):
         return None
     return points if len(points) >= 3 else None
 
-
 def point_in_polygon(lat, lon, polygon):
-    """Ray casting algorithm — returns True if (lat, lon) is inside polygon.
-    polygon is a list of (lat, lon) tuples."""
     if not polygon or len(polygon) < 3:
-        return True  # no polygon — accept everything (bbox already filtered)
+        return True
     inside = False
     n = len(polygon)
     j = n - 1
@@ -483,13 +407,6 @@ def in_bbox(lat, lon, bbox):
     return (bbox["min_lat"] <= lat <= bbox["max_lat"] and
             bbox["min_lon"] <= lon <= bbox["max_lon"])
 
-# ═══════════════════════════════════════════════════════════
-# SOURCE 1: OVERPASS API
-# ═══════════════════════════════════════════════════════════
-
-# Circuit breaker: when shared across threads, the first failure causes
-# all remaining queries to skip instantly instead of wasting 90+ seconds
-# each on timeouts/retries.
 class OverpassCircuitBreaker:
     def __init__(self):
         self._lock = Lock()
@@ -514,7 +431,6 @@ class OverpassCircuitBreaker:
         with self._lock:
             self._tripped = False
             self._reason = ""
-
 
 def build_overpass_queries(bbox, sport_config):
     bbox_str = f"{bbox['min_lat']},{bbox['min_lon']},{bbox['max_lat']},{bbox['max_lon']}"
@@ -552,10 +468,6 @@ def build_overpass_queries(bbox, sport_config):
 
 def query_overpass(name, query, overpass_url, status_callback, breaker,
                     use_cache=True, timeout=45):
-    """Run a single Overpass query. Fail fast — no retries, no per-query
-    mirror hopping. The circuit breaker ensures that once any query fails,
-    subsequent queries skip immediately."""
-    # Check cache first (always)
     if use_cache:
         cache_k = _cache_key("overpass", overpass_url, query)
         cached = cache_get(cache_k)
@@ -564,7 +476,6 @@ def query_overpass(name, query, overpass_url, status_callback, breaker,
                 status_callback(f"  [{name}] 💾 cached ({len(cached)} elements)")
             return name, cached
 
-    # If circuit breaker is tripped, skip immediately
     if breaker.is_tripped():
         with _log_lock:
             status_callback(f"  [{name}] ⏭️ skipped (Overpass unavailable)")
@@ -601,10 +512,7 @@ def query_overpass(name, query, overpass_url, status_callback, breaker,
                         f"remaining queries will skip")
     return name, []
 
-
 def probe_overpass(overpass_url, timeout=5):
-    """Send a trivial query to check if endpoint is responsive.
-    Returns (url, success, reason). No logging — caller decides what to print."""
     probe_query = "[out:json][timeout:3];node(0,0,0.001,0.001);out count;"
     resp = None
     try:
@@ -622,13 +530,8 @@ def probe_overpass(overpass_url, timeout=5):
     except Exception as e:
         return overpass_url, False, type(e).__name__
 
-
 def pick_working_overpass(preferred_url, status_callback, is_local=False):
-    """Probe ALL candidate endpoints IN PARALLEL. First one to respond wins.
-    This cuts worst-case delay from 40s (sequential 4 mirrors × 10s) to ~5s
-    (all probed concurrently, first to succeed is used)."""
     if is_local:
-        # Local URL — only try it
         url, ok, reason = probe_overpass(preferred_url, timeout=5)
         name = url.split("//")[1].split("/")[0] if "//" in url else url
         if ok:
@@ -638,7 +541,6 @@ def pick_working_overpass(preferred_url, status_callback, is_local=False):
             status_callback(f"  ❌ {name} {reason}")
             return None
 
-    # Public — probe preferred + all mirrors in parallel, take first success
     urls_to_try = [preferred_url]
     for mirror in OVERPASS_MIRRORS:
         if mirror != preferred_url:
@@ -647,15 +549,12 @@ def pick_working_overpass(preferred_url, status_callback, is_local=False):
     status_callback(f"  Probing {len(urls_to_try)} endpoints in parallel...")
 
     with ThreadPoolExecutor(max_workers=len(urls_to_try)) as executor:
-        # Submit all probes simultaneously
         futures = {executor.submit(probe_overpass, url, 5): url for url in urls_to_try}
-        # as_completed yields results as they finish — first success wins
         for future in as_completed(futures):
             url, ok, reason = future.result()
             name = url.split("//")[1].split("/")[0] if "//" in url else url
             if ok:
                 status_callback(f"  ✅ {name} responsive (using this)")
-                # Cancel remaining probes (they're still running but we don't care)
                 for f in futures:
                     f.cancel()
                 return url
@@ -664,26 +563,14 @@ def pick_working_overpass(preferred_url, status_callback, is_local=False):
 
     return None
 
-
 def fetch_overpass(bbox, sport_config, overpass_url, status_callback,
                     is_local=False, use_cache=True):
-    """Run all Overpass queries in parallel with fail-fast behavior.
-
-    Strategy:
-      1. First, probe with a trivial 10-second query to see if Overpass works.
-      2. If probe fails, try public mirrors until one responds (or give up).
-      3. If all mirrors fail, return [] immediately — no wasted minutes.
-      4. If any query during the real fetch fails, the circuit breaker trips
-         and remaining queries skip instantly.
-    """
     is_local_url = ("localhost" in overpass_url or "127.0.0.1" in overpass_url
                     or is_local)
 
     status_callback(f"Source 1: Overpass API ({'LOCAL' if is_local_url else 'PUBLIC'})...")
 
-    # Step 1: Find a working endpoint — use a 5-minute cache to skip re-probing
-    # on every search when you're searching multiple cities back-to-back.
-    PROBE_CACHE_TTL = 300  # 5 minutes
+    PROBE_CACHE_TTL = 300
     probe_cache_key = _cache_key("overpass_probe_ok", overpass_url)
     cached_working = None
     if use_cache:
@@ -701,13 +588,11 @@ def fetch_overpass(bbox, sport_config, overpass_url, status_callback,
                             "Skipping Overpass — using Nominatim only.")
             return []
         if use_cache:
-            # Cache short-term (5 min) — mirror health changes over hours
             _cache_set_with_ttl(probe_cache_key, working_url, PROBE_CACHE_TTL)
 
     if working_url != overpass_url:
         status_callback(f"  ℹ️ Using fallback mirror")
 
-    # Step 2: Actual queries with circuit breaker
     max_workers = 6 if is_local_url else 3
     status_callback(f"  Running queries ({max_workers} parallel workers)...")
     queries = build_overpass_queries(bbox, sport_config)
@@ -750,9 +635,6 @@ def fetch_overpass(bbox, sport_config, overpass_url, status_callback,
     status_callback(f"  Overpass total: {len(results)} raw elements")
     return results
 
-# ═══════════════════════════════════════════════════════════
-# SOURCE 2: NOMINATIM SEARCH
-# ═══════════════════════════════════════════════════════════
 def build_nominatim_searches(city, state, sport_config):
     facility = sport_config["facility_label"].lower()
     return [
@@ -775,10 +657,9 @@ def fetch_nominatim(city, state, bbox, sport_config, status_callback, use_cache=
     status_callback("Source 2: Nominatim Search API...")
     searches = build_nominatim_searches(city, state, sport_config)
     results = []
-    nominatim_broken = False  # trips when Nominatim is completely unavailable
+    nominatim_broken = False
 
     for query in searches:
-        # Check cache
         cached_data = None
         if use_cache:
             key = _cache_key("nominatim_search", query)
@@ -799,7 +680,7 @@ def fetch_nominatim(city, state, bbox, sport_config, status_callback, use_cache=
                 if use_cache:
                     cache_set(_cache_key("nominatim_search", query), data)
                 from_cache = False
-                time.sleep(1.2)  # rate limit when actually hitting the API
+                time.sleep(1.2)
             except RuntimeError as e:
                 status_callback(f"  ❌ [{query[:50]}] {e}")
                 nominatim_broken = True
@@ -830,9 +711,6 @@ def fetch_nominatim(city, state, bbox, sport_config, status_callback, use_cache=
     status_callback(f"  Nominatim total: {len(results)} results")
     return results
 
-# ═══════════════════════════════════════════════════════════
-# CLASSIFICATION
-# ═══════════════════════════════════════════════════════════
 def is_confirmed_sport(entry, sport_config):
     sport = entry.get("sport", "").lower()
     return any(s in sport for s in sport_config["osm_sports"])
@@ -852,9 +730,34 @@ def is_facility(entry):
             any(k in name for k in ["park", "school", "college",
                                      "recreation", "field", "playground"]))
 
-# ═══════════════════════════════════════════════════════════
-# MERGE & DEDUPLICATE
-# ═══════════════════════════════════════════════════════════
+def is_too_small(entry, sport_config):
+    name = entry.get("name", "").lower()
+    if any(frag in name for frag in _TOO_SMALL_NAME_FRAGMENTS):
+        return True
+
+    leisure = entry.get("leisure", "").lower()
+    is_confirmed = is_confirmed_sport(entry, sport_config)
+    if leisure == "playground" and not is_confirmed:
+        return True
+
+    length_ft = entry.get("length_ft")
+    if length_ft:
+        min_ft = sport_config.get("min_pitch_length_ft", 0)
+        if length_ft < min_ft:
+            return True
+
+    children = entry.get("child_pitches", [])
+    if children:
+        min_ft = sport_config.get("min_pitch_length_ft", 0)
+        all_small = all(
+            (c.get("length_ft") or 0) > 0 and (c.get("length_ft") or 0) < min_ft
+            for c in children
+        )
+        if all_small:
+            return True
+
+    return False
+
 def merge_and_deduplicate(all_sources, sport_config, status_callback):
     status_callback(f"Total raw entries: {len(all_sources)}")
 
@@ -905,6 +808,60 @@ def merge_and_deduplicate(all_sources, sport_config, status_callback):
 
     facility_list = list(fac_seen.values())
 
+    _SCHOOL_PRIORITY = {
+        "high school": 0, "high sch": 0, "preparatory": 0, "prep school": 0,
+        "middle school": 1, "middle sch": 1, "junior high": 1, "intermediate": 1,
+        "elementary": 2, "primary school": 2,
+        "college": 3, "university": 3,
+    }
+
+    def _school_priority(name):
+        n = name.lower()
+        for kw, rank in _SCHOOL_PRIORITY.items():
+            if kw in n:
+                return rank
+        return 99
+
+    def _institution_stem(name):
+        n = name.lower()
+        for kw in ["high school", "middle school", "junior high", "elementary school",
+                   "elementary", "primary school", "preparatory", "prep school",
+                   "college", "university", "intermediate school", "intermediate"]:
+            n = n.replace(kw, "").strip()
+        return re.sub(r"[^a-z0-9]", "", n)
+
+    SAME_CAMPUS_RADIUS = 60
+    suppressed = set()
+    fl = facility_list
+    for i in range(len(fl)):
+        if i in suppressed:
+            continue
+        for j in range(i + 1, len(fl)):
+            if j in suppressed:
+                continue
+            a, b = fl[i], fl[j]
+            if not (a.get("lat") and a.get("lon") and b.get("lat") and b.get("lon")):
+                continue
+            dist = haversine(a["lat"], a["lon"], b["lat"], b["lon"])
+            if dist > SAME_CAMPUS_RADIUS:
+                continue
+            stem_a = _institution_stem(a.get("name", ""))
+            stem_b = _institution_stem(b.get("name", ""))
+            if not stem_a or not stem_b or stem_a != stem_b:
+                continue
+            pri_a = _school_priority(a.get("name", ""))
+            pri_b = _school_priority(b.get("name", ""))
+            if pri_a == 99 and pri_b == 99:
+                continue
+            if pri_a <= pri_b:
+                suppressed.add(j)
+            else:
+                suppressed.add(i)
+
+    if suppressed:
+        status_callback(f"  Same-campus dedup removed {len(suppressed)} co-located duplicate(s)")
+        facility_list = [fl[i] for i in range(len(fl)) if i not in suppressed]
+
     PROXIMITY_RADIUS = 200
     for pitch in confirmed:
         if not pitch.get("lat") or not pitch.get("lon"):
@@ -950,16 +907,20 @@ def merge_and_deduplicate(all_sources, sport_config, status_callback):
             results.append(fac)
 
     results = [r for r in results if r.get("name")]
+
+    before_size = len(results)
+    results = [r for r in results if not is_too_small(r, sport_config)]
+    removed_small = before_size - len(results)
+    if removed_small:
+        status_callback(f"  Removed {removed_small} too-small / wrong-type entries "
+                        f"(tot lots, playgrounds, undersized pitches)")
+
     multi = sum(1 for r in results if len(r.get("child_pitches", [])) > 1)
     status_callback(f"After merge: {len(results)} facilities ({multi} multi-court/field)")
     return results
 
-# ═══════════════════════════════════════════════════════════
-# REVERSE GEOCODE FOR ADDRESS + CITY VERIFICATION
-# ═══════════════════════════════════════════════════════════
 def _reverse_geocode_one(entry, target_city, nominatim_url=NOMINATIM_URL,
                            use_cache=True):
-    """Reverse geocode a single entry with caching."""
     tags = entry.get("tags", {})
     street = tags.get("addr:street", "")
     number = tags.get("addr:housenumber", "")
@@ -969,7 +930,6 @@ def _reverse_geocode_one(entry, target_city, nominatim_url=NOMINATIM_URL,
         entry["verified_city"] = city.lower()
         return entry, "osm_tags"
 
-    # Cache check — round coords to reduce cache misses for near-duplicates
     lat_r = round(entry["lat"], 5)
     lon_r = round(entry["lon"], 5)
     cache_hit = False
@@ -1012,15 +972,12 @@ def _reverse_geocode_one(entry, target_city, nominatim_url=NOMINATIM_URL,
         entry["verified_city"] = ""
     return entry, "api"
 
-
 def reverse_geocode_all(entries, target_city, status_callback,
                          use_local_nominatim=False, use_cache=True):
-    """Reverse geocode all entries with caching + parallelism."""
     nominatim_url = NOMINATIM_URL
     n = len(entries)
     status_callback(f"Reverse geocoding {n} facilities...")
 
-    # Step 1: handle OSM tag addresses first (no API call)
     osm_count = 0
     cache_count = 0
     api_needed = []
@@ -1030,7 +987,6 @@ def reverse_geocode_all(entries, target_city, status_callback,
             _reverse_geocode_one(entry, target_city, nominatim_url, use_cache)
             osm_count += 1
             continue
-        # Check cache
         if use_cache:
             lat_r = round(entry["lat"], 5)
             lon_r = round(entry["lon"], 5)
@@ -1052,7 +1008,6 @@ def reverse_geocode_all(entries, target_city, status_callback,
         status_callback(f"  All {n} addresses resolved without API calls")
         return
 
-    # Step 2: API calls for the rest
     if use_local_nominatim:
         status_callback(f"  Parallel reverse geocode {len(api_needed)} (local)...")
         with ThreadPoolExecutor(max_workers=8) as executor:
@@ -1071,24 +1026,15 @@ def reverse_geocode_all(entries, target_city, status_callback,
 
     status_callback(f"  Reverse geocoding complete")
 
-# ═══════════════════════════════════════════════════════════
-# FILTER BY CITY NAME — generalized for any US city
-# ═══════════════════════════════════════════════════════════
-
 def get_city_neighborhoods(city, state, country="USA", use_cache=True):
-    """Fetch all suburbs/neighborhoods/boroughs that belong to a city via Nominatim.
-    For example, Alameda includes 'Bay Farm Island'; New York includes 'Manhattan',
-    'Brooklyn', etc. Returns a set of lowercase names that should be treated as
-    'inside the city'."""
     key = _cache_key("city_neighborhoods", city, state, country)
     if use_cache:
         cached = cache_get(key)
         if cached is not None:
             return set(cached)
 
-    neighborhoods = {city.lower()}  # always include the city itself
+    neighborhoods = {city.lower()}
 
-    # Nominatim search for suburbs within the city
     try:
         params = {
             "q": f"{city}, {state}, {country}",
@@ -1098,91 +1044,52 @@ def get_city_neighborhoods(city, state, country="USA", use_cache=True):
         data, _ = _nominatim_request("/search", params)
         for item in data:
             addr = item.get("address", {})
-            # Anything Nominatim labels with our city as the parent counts
             for key_name in ("city", "town", "village", "suburb",
                               "neighbourhood", "borough", "city_district"):
                 v = addr.get(key_name, "").lower().strip()
                 if v and v == city.lower():
-                    # This item is within our target city — its name is a valid alias
                     name = item.get("display_name", "").split(",")[0].lower().strip()
                     if name and name != city.lower():
                         neighborhoods.add(name)
     except Exception:
-        pass  # neighborhoods are an enhancement, not required
+        pass
 
     if use_cache:
         cache_set(key, list(neighborhoods))
     return neighborhoods
 
-
 def _parse_city_from_address(address):
-    """Extract the city name from an address string.
-
-    Handles common US address formats:
-      - "123 Main St, Newark, CA 94560"       → "newark"
-      - "Enterprise Drive, Newark, CA 94560"  → "newark"
-      - "37701 Spring Tide Road, Newark"       → "newark"
-      - "40000 Paseo Padre Parkway, Fremont"  → "fremont"
-
-    Strategy: split on commas, then scan each part for a token that looks
-    like a city name (not a street number, not a state abbreviation, not a
-    zip code, not empty). Returns lowercase city string or "" if not found.
-    """
     if not address:
         return ""
 
     parts = [p.strip() for p in address.split(",")]
-    # We need at least 2 parts: [street, city] or [street, city, state+zip]
     if len(parts) < 2:
         return ""
 
-    # Walk parts from index 1 onward (skip the street/number in parts[0])
     for part in parts[1:]:
         part = part.strip()
         if not part:
             continue
-        # Skip pure zip codes (5 digits, or 5+4 digits)
         if re.match(r"^\d{5}(-\d{4})?$", part):
             continue
-        # Skip US state abbreviations (2 uppercase letters, optionally followed by zip)
         if re.match(r"^[A-Z]{2}(\s+\d{5}(-\d{4})?)?$", part):
             continue
-        # Skip tokens that are only numbers
         if re.match(r"^\d+$", part):
             continue
-        # Skip "USA" / "United States"
         if part.lower() in ("usa", "united states", "us"):
             continue
-        # This part looks like a city name — strip any trailing state/zip that
-        # got merged into the same comma segment (e.g. "Newark CA 94560")
         city_token = re.split(r"\s+[A-Z]{2}\s+\d{5}", part)[0].strip()
         if city_token:
             return city_token.lower()
 
     return ""
 
-
 def filter_wrong_city(entries, target_city, target_state, bbox, status_callback,
                        use_cache=True):
-    """Remove facilities that are NOT inside the target city.
-
-    Uses 3-tier validation:
-      1. ADDRESS CITY CHECK (primary): parse the city name out of the
-         facility's address string. If the address clearly names a different
-         city, remove the facility. This is the most reliable signal because
-         the address already contains the city — e.g. "Newark, CA 94560"
-         tells us unambiguously this is not a Fremont facility.
-      2. POLYGON CHECK (when polygon is available): if the city polygon was
-         returned by Nominatim, use it as a precise inside/outside check for
-         facilities whose address city could not be determined.
-      3. VERIFIED_CITY / KEEP-IF-UNCERTAIN: last resort — if reverse geocode
-         populated verified_city, use that. Otherwise keep (benefit of doubt).
-    """
     status_callback(f"Filtering facilities outside {target_city}...")
     target = target_city.lower().strip()
     polygon = bbox.get("polygon") if bbox else None
 
-    # Get city aliases (e.g. historic neighborhoods that are part of the city)
     valid_aliases = get_city_neighborhoods(target_city, target_state,
                                             use_cache=use_cache)
 
@@ -1205,24 +1112,18 @@ def filter_wrong_city(entries, target_city, target_state, bbox, status_callback,
         v_city = entry.get("verified_city", "").lower().strip()
         address = entry.get("address", "")
 
-        # ── TIER 1: Address city check ──────────────────────────────────────
-        # Parse the city out of the address string directly.
-        # Example: "Enterprise Drive, Newark, CA 94560" → "newark"
         address_city = _parse_city_from_address(address)
 
         if address_city:
-            # Check if the address city matches the target or any of its aliases
             if address_city in valid_aliases or target in address_city or address_city in target:
                 filtered.append(entry)
                 continue
             else:
-                # Address explicitly names a different city — remove it
                 removed.append(
                     f"{entry['name']} (address city: '{address_city}' ≠ '{target}')"
                 )
                 continue
 
-        # ── TIER 2: Polygon check (for entries where address city is unknown) ─
         if polygon and lat and lon:
             if point_in_polygon(lat, lon, polygon):
                 filtered.append(entry)
@@ -1231,8 +1132,6 @@ def filter_wrong_city(entries, target_city, target_state, bbox, status_callback,
                 removed.append(f"{entry['name']} (outside city polygon)")
                 continue
 
-        # ── TIER 3: verified_city or keep-if-uncertain ──────────────────────
-        # Use the reverse-geocoded city if available
         if v_city:
             if v_city in valid_aliases or target in v_city or v_city in target:
                 filtered.append(entry)
@@ -1240,16 +1139,12 @@ def filter_wrong_city(entries, target_city, target_state, bbox, status_callback,
                 removed.append(f"{entry['name']} (verified city: '{v_city}' ≠ '{target}')")
             continue
 
-        # No address city, no polygon, no verified_city — keep as uncertain
         filtered.append(entry)
 
     status_callback(f"Removed {len(removed)} facilities outside {target_city}")
     status_callback(f"Kept {len(filtered)} facilities")
     return filtered, removed
 
-# ═══════════════════════════════════════════════════════════
-# CATEGORIZE
-# ═══════════════════════════════════════════════════════════
 def categorize(entries, sport_config, status_callback):
     exclude = sport_config["exclude"]
     entries = [e for e in entries if not any(k in e["name"].lower() for k in exclude)]
@@ -1287,9 +1182,6 @@ def categorize(entries, sport_config, status_callback):
 
     return categories
 
-# ═══════════════════════════════════════════════════════════
-# EXPAND TO ROWS
-# ═══════════════════════════════════════════════════════════
 def expand_to_rows(entries, sport_config, category_name):
     rows = []
     label = sport_config["facility_label"]
@@ -1318,14 +1210,21 @@ def expand_to_rows(entries, sport_config, category_name):
             elif "multi" in name_lower and "multi" in variants:
                 desc = variants["multi"]
 
+            tags = entry.get("tags", {})
+            if tags.get("lit", "") == "yes":
+                desc += " (Lighted)"
+
+            lat = entry["lat"]
+            lon = entry["lon"]
             rows.append({
                 "name": entry["name"],
                 "description": desc,
                 "address": entry.get("address", ""),
-                "lat": entry["lat"],
-                "lon": entry["lon"],
+                "lat": lat,
+                "lon": lon,
                 "length_ft": entry.get("length_ft"),
                 "width_ft": entry.get("width_ft"),
+                "google_earth_url": f"https://earth.google.com/web/@{lat},{lon},50a,300d,35y,0h,0t,0r",
             })
         else:
             for i, child in enumerate(children, 1):
@@ -1349,9 +1248,6 @@ def expand_to_rows(entries, sport_config, category_name):
                 elif hoops == "2" and "full" in variants:
                     suffix_parts.append(variants["full"])
 
-                surface = tags.get("surface", "")
-                if surface:
-                    suffix_parts.append(surface.replace("_", " ").title())
                 if tags.get("lit", "") == "yes":
                     suffix_parts.append("Lighted")
 
@@ -1359,20 +1255,20 @@ def expand_to_rows(entries, sport_config, category_name):
                 if suffix_parts:
                     desc += f" ({', '.join(suffix_parts)})"
 
+                child_lat = child.get("lat", entry["lat"])
+                child_lon = child.get("lon", entry["lon"])
                 rows.append({
                     "name": entry["name"],
                     "description": desc,
                     "address": entry.get("address", ""),
-                    "lat": child.get("lat", entry["lat"]),
-                    "lon": child.get("lon", entry["lon"]),
+                    "lat": child_lat,
+                    "lon": child_lon,
                     "length_ft": child.get("length_ft"),
                     "width_ft": child.get("width_ft"),
+                    "google_earth_url": f"https://earth.google.com/web/@{child_lat},{child_lon},50a,300d,35y,0h,0t,0r",
                 })
     return rows
 
-# ═══════════════════════════════════════════════════════════
-# BUILD EXCEL
-# ═══════════════════════════════════════════════════════════
 def build_excel(categories, sport_config, city, state):
     wb = Workbook()
     ws = wb.active
@@ -1399,10 +1295,14 @@ def build_excel(categories, sport_config, city, state):
     ws.column_dimensions["E"].width = 12
     ws.column_dimensions["F"].width = 14
     ws.column_dimensions["G"].width = 14
+    ws.column_dimensions["H"].width = 30
     ws.freeze_panes = "A2"
 
+    NUM_COLS = 8
+
     headers = ["Name of Facility", "Description of Facility", "Address",
-                "Latitude", "Longitude", "Length (ft)", "Width (ft)"]
+                "Latitude", "Longitude", "Length (ft)", "Width (ft)",
+                "Google Earth"]
     for col, h in enumerate(headers, 1):
         cell = ws.cell(row=1, column=col, value=h)
         cell.font = header_font
@@ -1429,15 +1329,18 @@ def build_excel(categories, sport_config, city, state):
         data_rows = expand_to_rows(entries, sport_config, section)
 
         ws.merge_cells(start_row=current_row, start_column=1,
-                       end_row=current_row, end_column=7)
+                       end_row=current_row, end_column=NUM_COLS)
         cell = ws.cell(row=current_row, column=1, value=section)
         cell.font = section_font
         cell.fill = section_fill
         cell.border = thin_border
-        for c in range(2, 8):
+        for c in range(2, NUM_COLS + 1):
             ws.cell(row=current_row, column=c).border = thin_border
             ws.cell(row=current_row, column=c).fill = section_fill
         current_row += 1
+
+        link_font_normal = Font(name="Arial", size=10, color="1155CC", underline="single")
+        link_font_blue = Font(name="Arial", size=10, color="1155CC", underline="single")
 
         for idx, row in enumerate(data_rows):
             fill = row_fill_blue if (idx % 2 == 1) else None
@@ -1448,6 +1351,7 @@ def build_excel(categories, sport_config, city, state):
                 round(row["lat"], 4), round(row["lon"], 4),
                 length_v if length_v else "N/A",
                 width_v if width_v else "N/A",
+                None,
             ]
             for col, v in enumerate(values, 1):
                 cell = ws.cell(row=current_row, column=col, value=v)
@@ -1456,6 +1360,16 @@ def build_excel(categories, sport_config, city, state):
                 cell.border = thin_border
                 if fill:
                     cell.fill = fill
+
+            ge_url = row.get("google_earth_url", "")
+            ge_cell = ws.cell(row=current_row, column=8, value="View on Earth")
+            ge_cell.hyperlink = ge_url
+            ge_cell.font = link_font_blue if fill else link_font_normal
+            ge_cell.alignment = Alignment(vertical="center", wrap_text=True)
+            ge_cell.border = thin_border
+            if fill:
+                ge_cell.fill = fill
+
             current_row += 1
             total += 1
 
@@ -1464,9 +1378,6 @@ def build_excel(categories, sport_config, city, state):
     buffer.seek(0)
     return buffer, total
 
-# ═══════════════════════════════════════════════════════════
-# STREAMLIT FRONTEND
-# ═══════════════════════════════════════════════════════════
 def main():
     st.set_page_config(
         page_title="US Sports Facility Finder",
@@ -1535,7 +1446,7 @@ def main():
                           "See OVERPASS_LOCAL_SETUP.md."),
                 )
             elif mirror_choice == "Auto (try all public mirrors)":
-                overpass_url = OVERPASS_MIRRORS[0]  # start with main, fallback via code
+                overpass_url = OVERPASS_MIRRORS[0]
             else:
                 overpass_url = mirror_choice
             st.caption("💡 Local Overpass (localhost) auto-detects and uses 6 "
@@ -1588,11 +1499,9 @@ def main():
     sport_config = SPORTS_CONFIG[sport_choice]
     log_messages = []
 
-    # Background log collector (hidden by default — user can expand later)
     def log(msg):
         log_messages.append(msg)
 
-    # Use a single status spinner that shows current step
     status = st.status("🍳 Cooking up your sports facility data...",
                         expanded=False)
 
@@ -1667,14 +1576,12 @@ def main():
 
         status.update(label=f"✅ Done! Found {total} facilities", state="complete")
 
-    # Show post-warnings outside the spinner
     if len(overpass_results) == 0:
         st.warning(
             "⚠️ **Overpass API was unavailable** — fell back to Nominatim only. "
             "May have missed some smaller facilities. Run locally for full data."
         )
 
-    # Display results
     st.success(f"✅ Found **{total}** {sport_config['facility_label'].lower()} entries "
                f"across **{sum(1 for v in categories.values() if v)}** categories in {city}")
 
@@ -1693,7 +1600,6 @@ def main():
                 for r in removed_list:
                     st.text(f"• {r}")
 
-    # Show preview table
     st.subheader("📋 Preview")
     preview_data = []
     for cat, items in categories.items():
@@ -1709,14 +1615,13 @@ def main():
                 "Lon": round(row["lon"], 4),
                 "Length (ft)": row.get("length_ft") or "N/A",
                 "Width (ft)": row.get("width_ft") or "N/A",
+                "Google Earth": row.get("google_earth_url", ""),
             })
     st.dataframe(preview_data, use_container_width=True, hide_index=True)
 
-    # Detailed log (hidden by default)
     with st.expander("🔍 View detailed log"):
         st.code("\n".join(log_messages), language="text")
 
-    # Download button
     filename = f"{city.replace(' ', '_')}_{sport_choice.replace(' / ', '_').replace(' ', '_')}.xlsx"
     st.download_button(
         label="📥 Download Excel File",
@@ -1726,7 +1631,6 @@ def main():
         type="primary",
         use_container_width=True,
     )
-
 
 if __name__ == "__main__":
     main()
